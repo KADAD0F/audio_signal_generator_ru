@@ -9,6 +9,7 @@ import shutil
 import wave
 import csv
 import re
+import threading
 
 # ==============================================================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -61,16 +62,38 @@ def check_internet() -> bool:
 
 def check_ffmpeg() -> bool:
     """
-    Проверяет наличие ffmpeg в системе через вызов 'ffmpeg -version'.
-    Необходим для экспорта в MP3.
+    Проверяет, установлен ли ffmpeg и доступен ли он для вызова из текущего окружения.
+    
+    Сначала выполняется поиск исполняемого файла 'ffmpeg' (или 'ffmpeg.exe' на Windows)
+    в путях, перечисленных в переменной окружения PATH, с помощью shutil.which().
+    Если файл найден — запускается команда 'ffmpeg -version' для подтверждения,
+    что программа действительно исполняема и не повреждена.
+    
+    Функция устойчива к ошибкам запуска, зависаниям и различиям между ОС
+    (включая Windows, где исполняемые файлы имеют расширение .exe).
+    
+    Возвращает True, если ffmpeg найден и успешно отвечает на запрос версии;
+    в противном случае — False.
     """
+    ffmpeg_path = shutil.which("ffmpeg")
+    if not ffmpeg_path:
+        return False
+
     try:
-        subprocess.run(['ffmpeg', '-version'],
-                       stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL,
-                       check=True)
-        return True
-    except (subprocess.CalledProcessError, FileNotFoundError):
+        # Запускаем ffmpeg с ключом -version и подавляем весь ввод-вывод
+        # stdin=DEVNULL предотвращает блокировку в случае неожиданного ожидания ввода
+        result = subprocess.run(
+            [ffmpeg_path, "-version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            timeout=5  # 5 секунд достаточно даже на слабых системах
+        )
+        # Успешный запуск означает возврат кода 0
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, subprocess.SubprocessError, OSError):
+        # Любая ошибка выполнения (включая отсутствие прав, повреждение бинарника и т.п.)
+        # интерпретируется как недоступность ffmpeg
         return False
 
 def determine_output_directory() -> str:
@@ -114,11 +137,8 @@ def determine_output_directory() -> str:
     print("\nВ Termux для доступа к общему хранилищу требуется разрешение.")
 
     while True:
-        choice = input(
-            "Попробовать запросить разрешение через termux-setup-storage? (y/n): "
-        ).strip().lower()
-
-        if choice in ('y', 'yes', 'да', 'д'):
+        choice = input("Попробовать запросить разрешение через termux-setup-storage? (y/n): ")
+        if is_yes(choice):
             print("Выполняется termux-setup-storage... Следуйте инструкциям на экране.")
             print("После завершения нажмите Enter, чтобы продолжить.")
             try:
@@ -129,7 +149,6 @@ def determine_output_directory() -> str:
 
             input()  # Ждём подтверждения от пользователя
 
-            # Повторная проверка
             if can_write_to(shared_dir):
                 print(f"✅ Доступ получен. Файлы будут сохранены в: {shared_dir}")
                 return shared_dir
@@ -137,15 +156,41 @@ def determine_output_directory() -> str:
                 print("❌ Доступ не предоставлен. Повторите попытку или выберите локальное сохранение.")
                 continue
 
-        elif choice in ('n', 'no', 'нет', 'н'):
+        if choice.strip().lower() in ('n', 'no', 'нет', 'н'):
             print(f"📁 Используется локальная директория Termux: {local_dir}")
             return local_dir
-        else:
-            print("Пожалуйста, введите 'y' или 'n'.")
 
-    # Если цикл завершился без успеха — резервный вариант
+        print("Пожалуйста, введите 'y' или 'n'.")
+
+    # Резервный вариант, если цикл прерван без возврата
     print(f"📁 Резерв: сохранение в локальную директорию {local_dir}")
     return local_dir
+
+def confirm_overwrite(filepath: str) -> str:
+    """
+    Проверяет, существует ли файл по указанному пути.
+    Если файл существует:
+      - спрашивает пользователя, перезаписать ли его;
+      - если пользователь отказывается — генерирует новое имя с суффиксом _1, _2, ...
+    Возвращает путь, по которому можно безопасно сохранить файл без перезаписи.
+    """
+    if not os.path.exists(filepath):
+        return filepath
+
+    print(f"⚠️  Файл уже существует: {filepath}")
+    choice = input("Перезаписать? (y/n): ").strip().lower()
+    if is_yes(choice):
+        return filepath
+
+    # Пользователь отказался → генерируем уникальное имя
+    base, ext = os.path.splitext(filepath)
+    counter = 1
+    while True:
+        new_path = f"{base}_{counter}{ext}"
+        if not os.path.exists(new_path):
+            print(f"📁 Используется новое имя: {new_path}")
+            return new_path
+        counter += 1
 
 # ==============================================================================
 # УСТАНОВКА ЗАВИСИМОСТЕЙ
@@ -646,20 +691,47 @@ def generate_multi(np, duration, sample_rate, channels):
     signals = []
     stereo_mode = channels == 2
 
+    # Допустимые типы сигналов
+    valid_types = ['sin', 'am', 'pulse', 'noise', 'chm']
+    # Сопоставление цифр → типы
+    digit_to_type = {
+        '1': 'sin',
+        '2': 'am',
+        '3': 'pulse',
+        '4': 'noise',
+        '5': 'chm'
+    }
+
+    def resolve_signal_type(user_input: str):
+        """Преобразует ввод (цифру, полное или сокращённое имя) в корректный тип сигнала."""
+        inp = user_input.strip().lower()
+        if not inp:
+            return None
+        # Сначала проверяем цифры
+        if inp in digit_to_type:
+            return digit_to_type[inp]
+        # Затем пробуем найти совпадение по префиксу
+        matches = [t for t in valid_types if t.startswith(inp)]
+        if len(matches) == 1:
+            return matches[0]
+        # Если неоднозначно или нет совпадений — None
+        return None
+
     print("\nДобавление сигналов (оставьте пустым для завершения):")
     while True:
-        signal_type = input("Тип сигнала (sin, am, pulse, noise, chm): ").strip().lower()
-        if not signal_type:
+        signal_type_input = input("Тип сигнала (sin, am, pulse, noise, chm): ").strip()
+        if not signal_type_input:
             break
-        if signal_type not in ['sin', 'am', 'pulse', 'noise', 'chm']:
-            print("Неверный тип. Допустимые: sin, am, pulse, noise, chm")
+
+        signal_type = resolve_signal_type(signal_type_input)
+        if signal_type is None:
+            print("Неверный тип. Допустимые: sin, am, pulse, noise, chm (или 1–5, или сокращения, например 'puls', 'noi', 'ch')")
             continue
 
         is_stereo = False
         if stereo_mode:
             stereo_choice = input("Создать разные сигналы для левого и правого канала? (y/n): ")
             is_stereo = is_yes(stereo_choice)
-
         try:
             params = get_signal_parameters(np, signal_type, sample_rate, is_stereo)
             params['stereo'] = is_stereo
@@ -692,19 +764,70 @@ def generate_multi(np, duration, sample_rate, channels):
 # ==============================================================================
 
 def save_wav(np, filename, sample_rate, data, channels):
-    """Сохраняет сигнал в WAV-файл (16-bit PCM)."""
-    data = normalize_signal(np, data)
-
-    if hasattr(np, 'int16'):
-        data_int16 = np.int16(data * 32767)
+    """
+    Сохраняет сигнал в WAV-файл (16-bit PCM).
+    
+    Поддерживает numpy и jax.numpy.
+    Обрабатывает как моно (1D), так и стерео (2D: (N, 2)) сигналы.
+    
+    Args:
+        np: библиотека для работы с массивами (numpy или jax.numpy)
+        filename: путь к выходному файлу
+        sample_rate: частота дискретизации
+        data: аудиоданные (1D для моно, 2D с shape=(N, 2) для стерео)
+        channels: количество каналов (1 или 2)
+    """
+    # Проверка входных данных
+    if channels not in (1, 2):
+        raise ValueError("Количество каналов должно быть 1 или 2")
+    
+    # Проверка типа данных
+    if not hasattr(data, 'dtype') or data.dtype.kind not in ('f', 'i'):
+        raise TypeError("Данные должны быть числового типа")
+    
+    # Защитная нормализация
+    data = normalize_signal(np, data, max_amplitude=0.99)
+    
+    # Обработка формы данных
+    if data.ndim == 2:
+        if data.shape[1] != channels:
+            raise ValueError(f"Ожидалось {channels} каналов, получено {data.shape[1]}")
+        # Интерливинг: (N, 2) → [L0, R0, L1, R1, ...]
+        data_flat = data.flatten(order='C')  # C-order = row-major = L, R, L, R...
+    elif data.ndim == 1:
+        if channels != 1:
+            raise ValueError("1D-сигнал, но указано channels != 1")
+        data_flat = data
     else:
-        data_int16 = (data * 32767).to(dtype=np.int16)
-
+        raise ValueError("Сигнал должен быть 1D или 2D массивом")
+    
+    # Проверка, что данные содержат числовые значения
+    if not np.issubdtype(data_flat.dtype, np.number):
+        data_flat = data_flat.astype(np.float32)
+    
+    # Масштабирование в 16-битный диапазон с полным использованием диапазона
+    # 32767.5 позволяет более точно использовать весь диапазон [-32768, 32767]
+    scaled = data_flat * 32767.5
+    clipped = np.clip(scaled, -32768, 32767)
+    rounded = np.round(clipped)
+    data_int16 = rounded.astype(np.int16)
+    
+    # Проверка на NaN и Inf
+    if hasattr(np, 'isnan') and np.isnan(data_int16).any():
+        raise ValueError("Данные содержат NaN значения")
+    if hasattr(np, 'isinf') and np.isinf(data_int16).any():
+        raise ValueError("Данные содержат бесконечные значения")
+    
+    # Запись в файл
     with wave.open(filename, 'wb') as wav_file:
         wav_file.setnchannels(channels)
-        wav_file.setsampwidth(2)
+        wav_file.setsampwidth(2)  # 16 бит = 2 байта
         wav_file.setframerate(sample_rate)
         wav_file.writeframes(data_int16.tobytes())
+    
+    # Проверка успешной записи
+    if not os.path.exists(filename) or os.path.getsize(filename) == 0:
+        raise IOError(f"Не удалось записать файл {filename}")
 
 def save_csv(filename, data, channels):
     """Сохраняет сигнал в CSV для анализа в Excel и т.п."""
@@ -723,21 +846,48 @@ def save_csv(filename, data, channels):
         print(f"Предупреждение: не удалось сохранить CSV: {e}")
 
 def save_mp3(np, AudioSegment, filename, sample_rate, data, channels):
-    """Сохраняет сигнал в MP3 через pydub и ffmpeg."""
-    data = normalize_signal(np, data)
-
-    if hasattr(np, 'int16'):
-        data_int16 = np.int16(data * 32767)
-    else:
-        data_int16 = (data * 32767).to(dtype=np.int16)
-
-    audio = AudioSegment(
-        data_int16.tobytes(),
-        frame_rate=sample_rate,
-        sample_width=2,
-        channels=channels
-    )
-    audio.export(filename, format='mp3')
+    """Сохраняет сигнал в MP3 через pydub и ffmpeg с полной обработкой ошибок."""
+    try:
+        # Нормализация сигнала
+        data = normalize_signal(np, data, max_amplitude=0.99)
+        
+        # Обработка стерео/моно данных
+        if data.ndim == 2:
+            if data.shape[1] != channels:
+                raise ValueError(f"Ожидалось {channels} каналов, получено {data.shape[1]}")
+            # Интерливинг для стерео (L1, R1, L2, R2, ...)
+            data_flat = data.flatten(order='C')
+        else:
+            if channels != 1:
+                raise ValueError(f"Ожидалось 1 канал, получено {channels}")
+            data_flat = data
+        
+        # Проверка размерности данных
+        if data_flat.ndim != 1:
+            raise ValueError("Данные должны быть одномерным массивом после обработки")
+        
+        # Преобразование в 16-битный формат
+        # Используем правильное преобразование с учетом диапазона
+        data_int16 = (data_flat * 32767.0).astype(np.int16)
+        
+        # Создание аудио сегмента
+        audio = AudioSegment(
+            data_int16.tobytes(),
+            frame_rate=sample_rate,
+            sample_width=2,
+            channels=channels
+        )
+        
+        # Сохранение в MP3
+        audio.export(filename, format='mp3')
+        return True
+    except Exception as e:
+        # Подробное логирование ошибки
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"❌ Ошибка при сохранении MP3: {str(e)}")
+        print(f"Детали ошибки:\n{error_details}")
+        return False
 
 def save_visualization(np, signal, output_dir, base_filename):
     """
@@ -780,10 +930,102 @@ def save_visualization(np, signal, output_dir, base_filename):
         print(f"Ошибка при создании визуализации: {e}")
         return False
 
+def save_spectrogram_video(np, signal, sample_rate, output_dir, base_filename, channels, hop_length=512, n_fft=2048):
+    """
+    Создаёт видео спектрограммы сигнала.
+    Поддерживает моно и стерео (обрабатывает только левый канал или среднее).
+    """
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import subprocess
+        import os
+        import tempfile
+        import shutil
+
+        # Подготовка сигнала: моно
+        if signal.ndim == 2:
+            # Берём среднее по каналам или только левый
+            mono_signal = np.mean(signal, axis=1)
+        else:
+            mono_signal = signal
+
+        # STFT
+        from numpy.fft import rfft, rfftfreq
+        window = np.hanning(n_fft)
+        num_frames = (len(mono_signal) - n_fft) // hop_length + 1
+        if num_frames <= 0:
+            raise ValueError("Сигнал слишком короткий для анализа")
+
+        # Создаём временную папку для кадров
+        with tempfile.TemporaryDirectory() as tmpdir:
+            print(f"Генерация {num_frames} кадров спектрограммы...")
+            for i in range(num_frames):
+                start = i * hop_length
+                frame = mono_signal[start:start + n_fft]
+                if len(frame) < n_fft:
+                    frame = np.pad(frame, (0, n_fft - len(frame)), mode='constant')
+                windowed = frame * window
+                spectrum = np.abs(rfft(windowed))
+                freqs = rfftfreq(n_fft, 1 / sample_rate)
+
+                # Ограничим частоты до Nyquist
+                max_freq_idx = np.argmax(freqs > sample_rate / 2)
+                if max_freq_idx == 0:
+                    max_freq_idx = len(freqs)
+                spectrum = spectrum[:max_freq_idx]
+                freqs = freqs[:max_freq_idx]
+
+                # Логарифмическая шкала (дБ)
+                spectrum_db = 20 * np.log10(spectrum + 1e-9)
+                spectrum_db = np.clip(spectrum_db, spectrum_db.max() - 80, None)
+
+                # Рисуем кадр
+                plt.figure(figsize=(10, 4))
+                plt.plot(freqs, spectrum_db, color='cyan')
+                plt.ylim(spectrum_db.max() - 80, spectrum_db.max())
+                plt.xlim(0, sample_rate / 2)
+                plt.xlabel('Частота (Гц)')
+                plt.ylabel('Амплитуда (дБ)')
+                plt.title(f'Спектрограмма | Время: {i * hop_length / sample_rate:.2f} с')
+                plt.grid(True, linestyle='--', alpha=0.5)
+                plt.tight_layout()
+                frame_path = os.path.join(tmpdir, f'frame_{i:06d}.png')
+                plt.savefig(frame_path, dpi=100)
+                plt.close()
+
+            # Собираем видео через ffmpeg
+            video_path = os.path.join(output_dir, f"{base_filename}_spectrogram.mp4")
+            cmd = [
+                'ffmpeg', '-y',
+                '-framerate', '20',
+                '-i', os.path.join(tmpdir, 'frame_%06d.png'),
+                '-c:v', 'libx264',
+                '-pix_fmt', 'yuv420p',
+                '-preset', 'fast',
+                '-crf', '23',
+                video_path
+            ]
+            result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if result.returncode != 0:
+                raise RuntimeError("ffmpeg не смог создать видео")
+
+        print(f"✅ Видео спектрограммы сохранено: {video_path}")
+        return video_path
+
+    except ImportError as e:
+        print(f"❌ Отсутствует зависимость: {e}")
+        return None
+    except Exception as e:
+        print(f"❌ Ошибка при создании видео спектрограммы: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
 # ==============================================================================
 # ОСНОВНАЯ ФУНКЦИЯ
 # ==============================================================================
-
 def main():
     """
     Главная функция программы.
@@ -792,8 +1034,8 @@ def main():
     2. Определяет директорию вывода
     3. Запрашивает тип сигнала и параметры
     4. Генерирует сигнал
-    5. Сохраняет в выбранных форматах
-    6. (Опционально) сохраняет визуализацию
+    5. Сохраняет в выбранных форматах с защитой от перезаписи
+    6. (Опционально) сохраняет визуализацию, CSV, спектрограмму
     """
     np = get_numpy_or_alternative()
     if np is None:
@@ -802,6 +1044,7 @@ def main():
 
     # Определение директории сохранения с проверкой прав
     output_dir = determine_output_directory()
+    in_termux = is_termux()
 
     # Вывод справки по типам сигналов
     print("\n" + "="*50)
@@ -829,7 +1072,6 @@ def main():
         '5': 'chm', 'chm': 'chm',
         '6': 'multi', 'multi': 'multi'
     }
-
     signal_type = input("\nВыберите тип сигнала (1-6 или название): ").strip().lower()
     if signal_type not in signal_map:
         print("Ошибка: неверный выбор типа сигнала")
@@ -845,7 +1087,6 @@ def main():
     # Проверка свободного места
     num_samples = int(duration * sample_rate * channels)
     estimated_size = num_samples * 4  # ~4 байта на float32
-
     free_space = get_disk_space(output_dir)
     if free_space and free_space < estimated_size * 1.5:
         print(f"\n⚠️  Недостаточно места на диске!")
@@ -868,8 +1109,8 @@ def main():
     raw_name = input("Имя выходного файла (без расширения): ")
     output_filename = sanitize_filename(raw_name)
 
+    # --- ГЕНЕРАЦИЯ СИГНАЛА ---
     try:
-        # Генерация сигнала
         if signal_type == 'multi':
             signal = generate_multi(np, duration, sample_rate, channels)
         else:
@@ -883,39 +1124,211 @@ def main():
         print("2. MP3 (требуется ffmpeg и pydub)")
         print("3. Оба формата")
         format_choice = get_input("Ваш выбор", default=1, min_val=1, max_val=3, type_func=int)
+        formats_saved = []
+        mp3_saved = False
 
+        # --- Сохранение WAV ---
         if format_choice in [1, 3]:
             output_wav = os.path.join(output_dir, output_filename + ".wav")
-            save_wav(np, output_wav, sample_rate, signal, channels)
-            print(f"\n✅ WAV сохранен в {output_wav}")
+            safe_wav = confirm_overwrite(output_wav)
+            try:
+                save_wav(np, safe_wav, sample_rate, signal, channels)
+                formats_saved.append("WAV")
+                print(f"\n✅ WAV сохранен в {safe_wav}")
+            except Exception as e:
+                print(f"❌ Ошибка при сохранении WAV: {e}")
+                import traceback
+                traceback.print_exc()
 
+        # --- Сохранение MP3 ---
         if format_choice in [2, 3]:
-            if not check_ffmpeg():
+            ffmpeg_available = check_ffmpeg()
+            if not ffmpeg_available:
                 print("⚠️  ffmpeg не найден. Установите ffmpeg для сохранения в MP3.")
                 print("   На Ubuntu: sudo apt install ffmpeg")
-                print("   На Windows: https://ffmpeg.org/download.html  ")
+                print("   На Windows: https://ffmpeg.org/download.html")
                 print("   На macOS: brew install ffmpeg")
+                print("   Для Termux: pkg install ffmpeg")
             else:
                 try:
                     from pydub import AudioSegment
                     output_mp3 = os.path.join(output_dir, output_filename + ".mp3")
-                    save_mp3(np, AudioSegment, output_mp3, sample_rate, signal, channels)
-                    print(f"✅ MP3 сохранен в {output_mp3}")
+                    safe_mp3 = confirm_overwrite(output_mp3)
+                    if save_mp3(np, AudioSegment, safe_mp3, sample_rate, signal, channels):
+                        formats_saved.append("MP3")
+                        print(f"✅ MP3 сохранен в {safe_mp3}")
+                        mp3_saved = True
+                    else:
+                        print("❌ Не удалось сохранить MP3 файл")
                 except ImportError:
-                    print("MP3 сохранение невозможно: pydub не установлен")
+                    print("❌ MP3 сохранение невозможно: pydub не установлен")
+                    print("   Установите pydub командой: pip install pydub")
 
-        # Сохранение CSV
-        output_csv = os.path.join(output_dir, output_filename + ".csv")
-        save_csv(output_csv, signal, channels)
-        print(f"CSV сохранен в {output_csv}")
+            # Если MP3 не сохранился, а выбран только MP3 — предложить WAV
+            if not mp3_saved and format_choice == 2:
+                save_wav_alt = input("Хотите сохранить в формате WAV вместо MP3? (y/n): ")
+                if is_yes(save_wav_alt):
+                    output_wav = os.path.join(output_dir, output_filename + ".wav")
+                    safe_wav = confirm_overwrite(output_wav)
+                    try:
+                        save_wav(np, safe_wav, sample_rate, signal, channels)
+                        formats_saved.append("WAV")
+                        print(f"\n✅ WAV сохранен в {safe_wav}")
+                    except Exception as e:
+                        print(f"❌ Ошибка при сохранении WAV: {e}")
+                        import traceback
+                        traceback.print_exc()
+                else:
+                    print("❌ MP3 не сохранен, и вы отказались от сохранения в WAV.")
 
-        # Визуализация (опционально)
-        save_viz = input("\nСохранить визуализацию сигнала? (y/n): ")
-        if is_yes(save_viz):
-            save_visualization(np, signal, output_dir, output_filename)
+        # --- ДОПОЛНИТЕЛЬНЫЕ ОПЦИИ ДЛЯ ПРОФЕССИОНАЛОВ ---
+        print("\nДополнительные опции (enter для пропуска):")
+        print("1. Визуализация сигнала (график)")
+        print("2. Сохранение CSV (для Excel и анализа)")
+        print("3. Неконтролируемая амплитуда (без нормализации)")
+        print("4. Видео спектрограммы (экспериментальная функция)")
+        print("Важно: Дополнительные настройки могут быть нежелательны для тех, кто не знает что делать. Используйте с умом")
+        pro_choice = input("Выберите опции (например, '1 4' для визуализации и спектрограммы): ").strip()
+        professional_options = []
+        options = pro_choice.split()
+
+        if not options:
+            print("Дополнительные экспериментальные опции пропущены.")
+        else:
+            # Визуализация
+            if '1' in options:
+                print("\nНастройка визуализации...")
+                viz_base = os.path.join(output_dir, output_filename + "_visualization")
+                formats = ['png', 'svg', 'pdf']
+                fmt = input(f"Формат визуализации ({'/'.join(formats)}) [по умолчанию png]: ").strip().lower()
+                fmt = fmt if fmt in formats else 'png'
+                viz_path = f"{viz_base}.{fmt}"
+                safe_viz = confirm_overwrite(viz_path)
+                if save_visualization(np, signal, os.path.dirname(safe_viz), os.path.splitext(os.path.basename(safe_viz))[0]):
+                    professional_options.append("визуализация")
+                    print(f"✅ Визуализация сохранена в {safe_viz}")
+                else:
+                    print("❌ Не удалось сохранить визуализацию")
+
+            # CSV
+            if '2' in options:
+                print("\nСохранение CSV...")
+                output_csv = os.path.join(output_dir, output_filename + ".csv")
+                safe_csv = confirm_overwrite(output_csv)
+                try:
+                    save_csv(safe_csv, signal, channels)
+                    professional_options.append("CSV")
+                    print(f"✅ CSV сохранен в {safe_csv}")
+                except Exception as e:
+                    print(f"❌ Ошибка при сохранении CSV: {e}")
+
+            # Неконтролируемая амплитуда
+            if '3' in options:
+                print("\n⚠️  Неконтролируемая амплитуда (режим профессионала)")
+                max_amplitude = np.max(np.abs(signal))
+                if max_amplitude > 1.0:
+                    print(f"❗ ВНИМАНИЕ: Амплитуда превышает 1.0! Максимум: {max_amplitude:.4f}")
+                    print("Это может привести к клиппингу при воспроизведении")
+                else:
+                    print(f"Амплитуда в пределах: {max_amplitude:.4f}")
+                print("Сигнал сохранен без дополнительной нормализации")
+                professional_options.append("неконтролируемая амплитуда")
+
+            # Видео спектрограммы (экспериментальная функция)
+            if '4' in options:
+                # === 🔥 ПАСХАЛКА + ТАЙМЕРЫ НЕТЕРПЕЛИВОГО РАЗРАБА ===
+                if in_termux and duration >= 60:
+                    print("\nох зря брат.. поймешь через пару дней")
+                    time.sleep(1.5)  # драматическая пауза
+
+                    # Создаем список реплик разработчика
+                    dev_replies = [
+                        "Эээ... ты ещё жив? Я просто интересуюсь, как там спектрограмма.",
+                        "Ну так что? Уже всё? Или ты решил посидеть и подождать чуда?",
+                        "Неужели я забыл сказать, что это может занять... эээ... вечность?",
+                        "А если я сейчас закрою терминал — ты не обидишься? Просто мне надо поесть.",
+                        "Знаешь, я уже начал писать тебе письмо с извинениями за эту идею...",
+                        "Ты еще до живой? а твой телефон?",
+                        "Ладно, я ухожу. Но если вдруг закончишь — напиши мне. Я буду ждать... в другом потоке."
+                    ]
+
+                    # Флаг для отмены таймеров
+                    stop_dev_timer = False
+
+                    def dev_message(index):
+                        if stop_dev_timer:
+                            return
+                        if index < len(dev_replies):
+                            print(f"\n💬 [Разработчик] {dev_replies[index]}")
+                            # Запускаем следующий таймер (через 10 минут)
+                            timer = threading.Timer(600, dev_message, args=(index + 1,))
+                            timer.daemon = True
+                            timer.start()
+                        else:
+                            # После 7 реплик — разработчик уходит
+                            print("\n🚪 [Разработчик] Ушел. Надеюсь, ты не уснул. Или умер. Или просто выключил телефон.")
+                            print("💡 P.S. Если хочешь, можешь запустить это на ПК. Там быстрее. И без моих сообщений.")
+
+                    # Запускаем первый таймер (через 10 минут)
+                    first_timer = threading.Timer(600, dev_message, args=(0,))
+                    first_timer.daemon = True
+                    first_timer.start()
+
+                # === ГЕНЕРАЦИЯ ВИДЕО СПЕКТРОГРАММЫ ===
+                print("\nГенерация видео спектрограммы...")
+                spec_path = os.path.join(output_dir, f"{output_filename}_spectrogram.mp4")
+                safe_spec = confirm_overwrite(spec_path)
+
+                # Проверка наличия ffmpeg
+                if not check_ffmpeg():
+                    print("⚠️  ffmpeg не найден. Установите ffmpeg для создания спектрограммы.")
+                    print("   На Ubuntu: sudo apt install ffmpeg")
+                    print("   На Windows: https://ffmpeg.org/download.html")
+                    print("   На macOS: brew install ffmpeg")
+                    print("   Для Termux: pkg install ffmpeg")
+                else:
+                    try:
+                        spec_result = save_spectrogram_video(
+                            np, signal, sample_rate, output_dir,
+                            output_filename, channels, hop_length=512, n_fft=2048
+                        )
+                        if spec_result and os.path.exists(spec_result):
+                            professional_options.append("видео спектрограммы")
+                            print(f"✅ Видео спектрограммы сохранено: {spec_result}")
+
+                            # Отменяем все таймеры разработчика — работа завершена!
+                            stop_dev_timer = True
+                        else:
+                            print("❌ Не удалось создать видео спектрограммы")
+                    except Exception as e:
+                        print(f"❌ Ошибка при создании видео спектрограммы: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        # Отменяем таймеры при ошибке
+                        stop_dev_timer = True
+
+        # --- ИТОГОВЫЙ ОТЧЕТ ---
+        if formats_saved or professional_options:
+            all_saved = formats_saved + professional_options
+            print(f"\n{'='*50}")
+            print("УСПЕШНО СОХРАНЕНО")
+            print(f"Форматы: {', '.join(all_saved)}")
+            print(f"Каталог: {output_dir}")
+            print(f"Размер сигнала: {duration:.2f} сек, {sample_rate} Гц, {channels} каналов")
+            print(f"Оригинальная амплитуда: {np.max(np.abs(signal)):.4f}")
+            print(f"{'='*50}")
+        else:
+            print("\n❌ Не сохранено ни одного формата или опции")
 
     except Exception as e:
         print(f"❌ Ошибка: {e}")
+        import traceback
+        traceback.print_exc()
+        # Если произошла ошибка — отменяем таймеры
+        try:
+            stop_dev_timer = True
+        except:
+            pass
 
 # ==============================================================================
 # ТОЧКА ВХОДА
